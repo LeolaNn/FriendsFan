@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="uk"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Спільний перегляд</title>
+<style>
+:root{--bg:#fafafa;--fg:#1a1a1f;--card:#fff;--mut:#666;--ac:#6d4aff;--bd:#ddd}
+@media (prefers-color-scheme:dark){:root{--bg:#121216;--fg:#eee;--card:#1d1d24;--mut:#9a9aa5;--bd:#33333d}}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:900px;margin:0 auto;padding:16px}
+h1{font-size:1.3rem;margin:0 0 12px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px;margin-bottom:12px}
+video{width:100%;max-height:70vh;background:#000;border-radius:8px;display:block}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+button,input{font:inherit;padding:8px 12px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--fg)}
+button{cursor:pointer}button.p{background:var(--ac);color:#fff;border-color:var(--ac)}
+.mut{color:var(--mut);font-size:.9rem}
+#bar{margin-top:8px}#bar input[type=range]{flex:1;min-width:150px;padding:0}
+[hidden]{display:none!important}
+</style></head><body><main>
+<h1>🎬 Спільний перегляд</h1>
+
+<div class="card">
+  <div class="row">
+    <input id="room" placeholder="Код кімнати (будь-який)" size="16">
+    <button id="join" class="p">Увійти</button>
+    <button id="copy">Копіювати посилання</button>
+    <span class="mut" id="status">Не підключено</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row"><span class="mut">Обрати серію (її побачать усі):</span><input type="file" id="file" accept="video/*,.mkv"><button id="castbtn2" class="p" hidden>▶ Почати трансляцію (стабільний режим)</button><button id="castbtn" hidden>Запасний режим</button></div>
+  <p class="mut" style="margin:8px 0 0">Файл обирає один, решта бачать його трансляцію. Не закривайте вкладку, поки йде перегляд. Краще Chrome або Edge.</p>
+</div>
+
+<div class="card">
+  <video id="v" playsinline></video>
+  <div id="bar" class="row" hidden>
+    <button id="pp">⏯</button><button id="b10">−10с</button><button id="f10">+10с</button>
+    <input type="range" id="seek" min="0" max="1" step="0.1" value="0">
+    <span class="mut" id="tm">0:00</span>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button id="unmute" hidden>🔊 Увімкнути звук</button>
+    <span class="mut" id="who"></span>
+    <span class="mut" id="peers"></span>
+  </div>
+</div>
+<div class="card mut" id="log" style="max-height:100px;overflow:auto"></div>
+</main>
+<script>
+const $=id=>document.getElementById(id), v=$('v');
+let ICE={iceServers:[{urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302']}]};
+let ws=null,room='',myId=null,isCaster=false,stream=null,retry=null;
+const pcs=new Map();
+const log=t=>{const d=document.createElement('div');d.textContent=t;$('log').prepend(d)};
+const tx=o=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify(o))};
+const fmt=s=>{s=Math.floor(s||0);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
+
+function mode(caster){
+  isCaster=caster;
+  v.controls=caster;
+  $('bar').hidden=caster;
+  $('who').textContent=caster?'Ви транслюєте серію':'Ви дивитесь трансляцію';
+}
+function closeAll(){pcs.forEach(p=>p.close());pcs.clear()}
+
+function connect(){
+  clearTimeout(retry);
+  if(ws){ws.onclose=null;ws.close()}
+  ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host);
+  ws.onopen=()=>{tx({type:'join',room});$('status').textContent='Підключено: '+room};
+  ws.onclose=()=>{$('status').textContent='Перепідключення…';closeAll();retry=setTimeout(connect,2000)};
+  ws.onmessage=e=>{let m;try{m=JSON.parse(e.data)}catch{return}
+    if(m.type==='hello'){myId=m.id;if(m.caster&&m.caster!==myId)mode(false);}
+    else if(m.type==='peers')$('peers').textContent='У кімнаті: '+m.n;
+    else if(m.type==='caster'){
+      if(m.id&&m.id!==myId){if(isCaster){closeAll();v.removeAttribute('src');}mode(false);log('Хтось почав трансляцію')}
+      if(!m.id&&!isCaster){closeAll();v.srcObject=null;log('Трансляцію зупинено')}
+    }
+    else if(m.type==='viewer'&&isCaster)startPeer(m.id);
+    else if(m.type==='viewers'&&isCaster)m.ids.forEach(startPeer);
+    else if(m.type==='gone'){const p=pcs.get(m.id);if(p){p.close();pcs.delete(m.id)}}
+    else if(m.type==='signal')onSignal(m.from,m.data);
+    else if(m.type==='cmd'&&isCaster)doCmd(m);
+    else if(m.type==='info'&&!isCaster){$('seek').max=m.d||1;$('seek').value=m.t;$('tm').textContent=fmt(m.t)+' / '+fmt(m.d);$('pp').textContent=m.p?'▶':'⏸'}
+  };
+}
+
+/* --- транслятор --- */
+function startPeer(id){
+  if(pcs.has(id))pcs.get(id).close();
+  const pc=new RTCPeerConnection(ICE);pcs.set(id,pc);
+  pc.onicecandidate=e=>e.candidate&&tx({type:'signal',to:id,data:{ice:e.candidate}});
+  pc.onnegotiationneeded=async()=>{try{await pc.setLocalDescription();tx({type:'signal',to:id,data:{sdp:pc.localDescription}})}catch(err){log('Помилка з\'єднання: '+err.message)}};
+  pc.onconnectionstatechange=()=>{if(pc.connectionState==='failed')log('Не вдалося з\'єднатися з одним із глядачів (мережа/NAT)')};
+  const add=()=>stream.getTracks().forEach(t=>{
+    if(pc.getSenders().some(s=>s.track===t))return;
+    if(t.kind==='video')t.contentHint='motion';
+    const s=pc.addTrack(t,stream);
+    if(t.kind==='video'){
+      try{ // програмний VP8 замість апаратного кодувача: стабільніше
+        const tr=pc.getTransceivers().find(x=>x.sender===s);
+        const c=RTCRtpSender.getCapabilities('video').codecs;
+        tr.setCodecPreferences(c.filter(x=>x.mimeType==='video/VP8').concat(c.filter(x=>x.mimeType!=='video/VP8')));
+      }catch{}
+      try{
+        const p=s.getParameters();if(!p.encodings||!p.encodings.length)p.encodings=[{}];
+        p.encodings[0].maxBitrate=2.5e6;p.encodings[0].maxFramerate=24;
+        const vh=(t.getSettings&&t.getSettings().height)||v.videoHeight;if(vh>720)p.encodings[0].scaleResolutionDownBy=vh/720;
+        s.setParameters(p);
+      }catch{}
+    }
+  });
+  add();stream.addEventListener('addtrack',add);
+}
+function doCmd(m){
+  if(m.a==='play')v.play();else if(m.a==='pause')v.pause();
+  else if(m.a==='toggle')v.paused?v.play():v.pause();
+  else if(m.a==='seek')v.currentTime=Math.max(0,m.t);
+}
+setInterval(()=>{if(isCaster)tx({type:'info',t:v.currentTime,d:v.duration||0,p:v.paused})},1000);
+
+$('file').onchange=e=>{
+  const f=e.target.files[0];if(!f)return;
+  if(!room||!ws||ws.readyState!==1){log('Спершу увійдіть у кімнату');e.target.value='';return}
+  closeAll();v.srcObject=null;$('castbtn').hidden=true;$('castbtn2').hidden=true;
+  log('Файл: '+f.name+' ('+Math.round(f.size/1048576)+' МБ)');
+  v.preload='metadata';
+  v.onerror=()=>log('Помилка відео: '+(v.error?(v.error.message||v.error.code):'невідома'));
+  v.onloadedmetadata=()=>{log('Файл відкрито: '+v.videoWidth+'×'+v.videoHeight+'. Тепер натисніть «Почати трансляцію»');$('castbtn').hidden=false;$('castbtn2').hidden=false};
+  v.controls=true;$('bar').hidden=true;
+  v.src=URL.createObjectURL(f);
+};
+$('castbtn').onclick=()=>{
+  try{stream=(v.captureStream||v.mozCaptureStream).call(v)}catch(err){return log('Не вдалося захопити відео: '+err.message)}
+  mode(true);tx({type:'cast'});$('castbtn').hidden=true;$('castbtn2').hidden=true;log('Трансляція почалася');
+};
+
+$('castbtn2').onclick=async()=>{
+  try{
+    stream=await navigator.mediaDevices.getDisplayMedia({video:{frameRate:24},audio:true,preferCurrentTab:true,selfBrowserSurface:'include',systemAudio:'include'});
+  }catch(err){return log('Захоплення скасовано або недоступне: '+err.message)}
+  if(!stream.getAudioTracks().length)log('Звуку немає: у вікні вибору поставте галочку «Ділитися звуком вкладки»');
+  stream.getVideoTracks()[0].onended=()=>{closeAll();log('Захоплення зупинено')};
+  mode(true);tx({type:'cast'});$('castbtn').hidden=true;$('castbtn2').hidden=true;
+  log('Трансляція почалася. Увімкніть відео на весь екран (F), щоб глядачі бачили лише картинку');
+  try{await v.requestFullscreen()}catch{}
+};
+
+/* --- глядач --- */
+async function onSignal(from,d){
+  let pc=pcs.get(isCaster?from:'c');
+  if(d.sdp){
+    if(d.sdp.type==='offer'){
+      if(!pc){
+        pc=new RTCPeerConnection(ICE);pcs.set('c',pc);
+        pc.onicecandidate=e=>e.candidate&&tx({type:'signal',to:from,data:{ice:e.candidate}});
+        pc.ontrack=e=>{if(v.srcObject!==e.streams[0])v.srcObject=e.streams[0];
+          v.play().catch(()=>{v.muted=true;v.play();$('unmute').hidden=false})};
+      }
+      await pc.setRemoteDescription(d.sdp);await pc.setLocalDescription();
+      tx({type:'signal',to:from,data:{sdp:pc.localDescription}});
+    }else if(pc)await pc.setRemoteDescription(d.sdp);
+  }else if(d.ice&&pc){try{await pc.addIceCandidate(d.ice)}catch{}}
+}
+$('unmute').onclick=()=>{v.muted=false;$('unmute').hidden=true};
+$('pp').onclick=()=>tx({type:'cmd',a:'toggle'});
+$('b10').onclick=()=>tx({type:'cmd',a:'seek',t:+$('seek').value-10});
+$('f10').onclick=()=>tx({type:'cmd',a:'seek',t:+$('seek').value+10});
+$('seek').onchange=()=>tx({type:'cmd',a:'seek',t:+$('seek').value});
+
+async function loadIce(){
+  try{const r=await fetch('/ice');const l=await r.json();ICE={iceServers:l};
+    log(JSON.stringify(l).includes('turn:')?'TURN підключено':'TURN не налаштовано (лише STUN)')}catch{}
+}
+$('join').onclick=async()=>{
+  room=$('room').value.trim().toLowerCase().replace(/[^a-z0-9_-]/g,'');
+  if(!room)return log('Введіть код кімнати (латиниця/цифри)');
+  history.replaceState(null,'','#'+room);await loadIce();connect();
+};
+$('copy').onclick=()=>{if(!room)return log('Спершу увійдіть у кімнату');
+  navigator.clipboard.writeText(location.origin+'/#'+room).then(()=>log('Посилання скопійовано'))};
+if(location.hash.length>1){$('room').value=decodeURIComponent(location.hash.slice(1));$('join').click()}
+</script></body></html>
