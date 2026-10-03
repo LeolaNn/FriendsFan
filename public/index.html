@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="uk"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Спільний перегляд</title>
+<style>
+:root{--bg:#fafafa;--fg:#1a1a1f;--card:#fff;--mut:#666;--ac:#6d4aff;--bd:#ddd}
+@media (prefers-color-scheme:dark){:root{--bg:#121216;--fg:#eee;--card:#1d1d24;--mut:#9a9aa5;--bd:#33333d}}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:900px;margin:0 auto;padding:16px}
+h1{font-size:1.3rem;margin:0 0 12px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px;margin-bottom:12px}
+video{width:100%;max-height:70vh;background:#000;border-radius:8px;display:block}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+button,input{font:inherit;padding:8px 12px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--fg)}
+button{cursor:pointer}button.p{background:var(--ac);color:#fff;border-color:var(--ac)}
+input.url{flex:1;min-width:200px}
+.mut{color:var(--mut);font-size:.9rem}
+</style></head><body><main>
+<h1>🎬 Спільний перегляд</h1>
+
+<div class="card">
+  <div class="row">
+    <input id="room" placeholder="Код кімнати (будь-який)" size="16">
+    <button id="join" class="p">Увійти</button>
+    <button id="copy">Копіювати посилання</button>
+    <span class="mut" id="status">Не підключено</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row"><span class="mut">Локальний файл:</span><input type="file" id="file" accept="video/*"></div>
+  <div class="row" style="margin-top:8px">
+    <input class="url" id="url" placeholder="Пряме посилання на відео (.mp4 / .webm), для всіх">
+    <button id="load">Завантажити</button>
+  </div>
+  <p class="mut" style="margin:8px 0 0">Файл кожен відкриває у себе (та сама серія). Посилання завантажується в усіх одразу.</p>
+</div>
+
+<div class="card">
+  <video id="v" controls playsinline></video>
+  <div class="row" style="margin-top:8px">
+    <button id="sync">⟲ Синхронізувати всіх зі мною</button>
+    <span class="mut" id="peers"></span>
+  </div>
+</div>
+<div class="card mut" id="log" style="max-height:100px;overflow:auto"></div>
+</main>
+<script>
+const $=id=>document.getElementById(id), v=$('v');
+let ws=null, room='', mute=false, retry=null;
+const log=t=>{const d=document.createElement('div');d.textContent=t;$('log').prepend(d)};
+
+function connect(){
+  clearTimeout(retry);
+  if(ws){ws.onclose=null;ws.close()}
+  ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host);
+  ws.onopen=()=>{ws.send(JSON.stringify({type:'join',room}));$('status').textContent='Підключено: '+room};
+  ws.onmessage=e=>{let m;try{m=JSON.parse(e.data)}catch{return}
+    if(m.type==='peers')$('peers').textContent='У кімнаті: '+m.n;
+    else if(m.type==='url'){v.src=m.src;log('Завантажено відео за посиланням')}
+    else if(m.type==='ctl')apply(m)};
+  ws.onclose=()=>{$('status').textContent='Перепідключення…';retry=setTimeout(connect,2000)};
+}
+function tx(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o))}
+function local(){if(!mute&&room)tx({type:'ctl',a:v.paused?'pause':'play',t:v.currentTime})}
+v.addEventListener('play',local);v.addEventListener('pause',local);v.addEventListener('seeked',local);
+$('sync').onclick=local;
+
+function apply(d){
+  if(!v.src)return;
+  mute=true;
+  if(Math.abs(v.currentTime-d.t)>0.7)v.currentTime=d.t;
+  Promise.resolve(d.a==='play'?v.play():v.pause())
+    .catch(()=>log('Браузер заблокував автозапуск — натисніть Play'))
+    .finally(()=>setTimeout(()=>{mute=false},400));
+}
+$('file').onchange=e=>{const f=e.target.files[0];if(f){v.src=URL.createObjectURL(f);log('Відкрито: '+f.name)}};
+$('load').onclick=()=>{const u=$('url').value.trim();if(!u)return;v.src=u;tx({type:'url',src:u})};
+$('join').onclick=()=>{
+  room=$('room').value.trim().toLowerCase().replace(/[^a-z0-9_-]/g,'');
+  if(!room)return log('Введіть код кімнати (латиниця/цифри)');
+  history.replaceState(null,'','#'+room);connect();
+};
+$('copy').onclick=()=>{if(!room)return log('Спершу увійдіть у кімнату');
+  navigator.clipboard.writeText(location.origin+'/#'+room).then(()=>log('Посилання скопійовано'))};
+if(location.hash.length>1){$('room').value=decodeURIComponent(location.hash.slice(1));$('join').click()}
+</script></body></html>
