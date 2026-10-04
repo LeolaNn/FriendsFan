@@ -6,7 +6,29 @@ const { WebSocketServer } = require('ws');
 const PORT = process.env.PORT || 3000;
 const page = path.join(__dirname, 'public', 'index.html');
 
+let cfCache = null;
+async function cloudflareIce() {
+  const { CF_TURN_KEY_ID, CF_TURN_API_TOKEN } = process.env;
+  if (!CF_TURN_KEY_ID || !CF_TURN_API_TOKEN) return null;
+  if (cfCache && cfCache.exp > Date.now()) return cfCache.list;
+  try {
+    const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${CF_TURN_KEY_ID}/credentials/generate-ice-servers`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + CF_TURN_API_TOKEN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ttl: 86400 })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    let list = j.iceServers || j; if (!Array.isArray(list)) list = [list];
+    list = list.map(s => ({ ...s, urls: [].concat(s.urls).filter(u => !/:53(\?|$)/.test(u)) })).filter(s => s.urls.length);
+    cfCache = { list, exp: Date.now() + 12 * 3600 * 1000 };
+    return list;
+  } catch (e) { console.log('cloudflare turn error', e.message); return null; }
+}
+
 async function iceServers() {
+  const cf = await cloudflareIce();
+  if (cf) return [{ urls: ['stun:stun.l.google.com:19302'] }].concat(cf);
   const base = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
   const { METERED_APP, METERED_KEY, TURN_URLS, TURN_USER, TURN_PASS, ICE_JSON } = process.env;
   if (ICE_JSON) {
